@@ -1,160 +1,266 @@
 #!/usr/bin/env bash
 
-# ---------- CONFIG ---------- #
-RESULTS=20      # Edit to your desired no. of search reponse
-RECS_COUNT=12   # Edit to your desired no. of recommendations 
-THUMB_DIR="/tmp/yt-thumbs"
-CACHE_DIR="/tmp/yt-cache"
-DOWNLOAD_DIR="$HOME/Videos/yt-downloads"
-HISTORY_FILE="$HOME/.yt_history"
-COOKIES="$HOME/Downloads/cookies.txt"   # Edit path to your cookies.txt
-MPV="mpv --no-terminal --force-window=yes" 
-YTDLP_CMD="yt-dlp --no-warnings --quiet --cookies $COOKIES"
+# -------------------------
+# FILES
+# -------------------------
+YT_FOLDER="/tmp/.yt"
+CACHE_DIR="$YT_FOLDER/.yt-cache"
+THUMB_DIR="$YT_FOLDER/.yt-thumbs"
+LAST_QUERY_FILE="$YT_FOLDER/.yt-last"
+OFFSET_FILE="$YT_FOLDER/.yt-offset"
+HISTORY_FILE="$YT_FOLDER/.yt-history"
+QUEUE_FILE="$YT_FOLDER/.yt-queue"
 
-export THUMB_DIR YTDLP_CMD  # Export for use inside fzf subshells
-# ----------------------------
+MAX_HISTORY=100
+RESULTS_PER_PAGE=20
 
-mkdir -p "$THUMB_DIR" "$CACHE_DIR" "$DOWNLOAD_DIR"
-touch "$HISTORY_FILE"
+MPV="/usr/bin/mpv --no-terminal --force-window=yes --ytdl=yes"
+YT_DLP="$HOME/.local/bin/yt-dlp --no-warnings --quiet --js-runtimes node --cookies-from-browser firefox"
+JQ="/usr/bin/jq"
 
-# Helper to generate ID from URL
-get_id() { echo "$1" | sha256sum | cut -d" " -f1; }
+mkdir -p "$YT_FOLDER" "$CACHE_DIR" "$THUMB_DIR"
 
-show_search() {
-    local query="$1"
-    local cache_file="$CACHE_DIR/$(echo "$query" | sha256sum | cut -d" " -f1).txt"
+# -------------------------
+# CLEANUP
+# -------------------------
+find "$THUMB_DIR" -type f -mtime +2 -delete 2>/dev/null
 
-    if [ -f "$cache_file" ]; then
-        menu=$(cat "$cache_file")
-    else
-        echo "Searching YouTube..."
-        menu=$($YTDLP_CMD \
-            --print "%(title)s|%(duration_string)s|%(uploader)s|%(webpage_url)s" \
-            "ytsearch${RESULTS}:$query")
-        echo "$menu" > "$cache_file"
-    fi
+# -------------------------
+# SPINNER
+# -------------------------
+spinner() {
+    local pid=$1
+    local spin='|/-\'
+    while kill -0 $pid 2>/dev/null; do
+        printf "\r Loading... [%c]" "$spin"
+        spin=${spin#?}${spin%???}
+        sleep 0.1
+    done
+    printf "\r\033[K"
+}
 
-    selection=$(echo "$menu" | fzf -m \
-        --delimiter='|' \
-        --with-nth=1,2,3 \
-        --prompt="󰗃 YT > " \
-        --header="ENTER: Play | CTRL-R: Refresh | CTRL-D: Clear Cache | CTRL-S: Download | ESC: Search Menu" \
-        --layout=reverse --border --height=95% \
-        --preview-window=right:48% \
-        --bind "ctrl-r:reload($YTDLP_CMD --print '%(title)s|%(duration_string)s|%(uploader)s|%(webpage_url)s' 'ytsearch${RESULTS}:$query')" \
-        --bind "ctrl-d:execute-silent(rm -f $cache_file)+reload(echo 'Cache Cleared')+clear-query" \
-        --bind "ctrl-s:execute-silent(url=\$(echo {} | cut -d'|' -f4); title=\$(echo {} | cut -d'|' -f1); notify-send \"Downloading\" \"\$title\"; yt-dlp -o \"$DOWNLOAD_DIR/%(title)s.%(ext)s\" \"\$url\" && notify-send \"Done\" \"\$title\")" \
-        --preview '
-            title=$(echo {} | cut -d"|" -f1)
-            url=$(echo {} | cut -d"|" -f4)
-            id=$(echo "$url" | sha256sum | cut -d" " -f1)
-            img="$THUMB_DIR/$id.jpg"
-            
-            if [ ! -f "$img" ]; then
-                $YTDLP_CMD --skip-download --write-thumbnail --convert-thumbnails jpg \
-                    -o "$THUMB_DIR/$id" "$url" > /dev/null 2>&1
-                [ -f "$THUMB_DIR/$id.jpg" ] || [ ! -f "$THUMB_DIR/$id.webp" ] || mv "$THUMB_DIR/$id.webp" "$img"
-            fi
+# -------------------------
+# THUMBNAILS
+# -------------------------
+preload_thumbs() {
+    while read -r line; do
+        id=$(echo "$line" | $JQ -r .id)
+        thumb=$(echo "$line" | $JQ -r .thumb)
+        file="$THUMB_DIR/$id.jpg"
 
-            # Header Space (Avoid overlap with image)
-            printf "\n \e[1;31m  YouTube Preview\e[0m\n"
-            printf " \e[1;37m%.110s\e[0m\n" "$title"
-            printf " --------------------------------------------------------------------------------------------------------------"
-
-            #for i in {1..110}; do echo -n "-"; done
-            
-            # The "Gap": Add enough newlines to push the image down
-            # Row 10 is where the image starts, so we make sure text stays at the top
-            printf "\n\n\n\n\n"
-
-            if [ -f "$img" ]; then
-                # --place width x height @ X-offset x Y-offset
-                # Smaller size (55x18) and lower Y-offset (@58x10) to clear the header
-                kitty +kitten icat --transfer-mode=memory --clear --stdin=no --place 80x55@70x60 "$img"
-            fi
-        ')
-    
-    kitty +kitten icat --clear
-    
-    [ -z "$selection" ] && return
-    echo "$selection" | while read -r line; do
-        url=$(echo "$line" | cut -d'|' -f4)
-        [ -z "$url" ] && continue
-        echo "$line" >> "$HISTORY_FILE"
-        $MPV "$url"
-        show_recommendations "$url" "$(echo "$line" | cut -d'|' -f1)"
+        [ ! -f "$file" ] && curl -s "$thumb" -o "$file" &
     done
 }
 
-show_recommendations() {
-    local last_url="$1"
-    local last_title="$2"
-    echo -e "\n\e[1;32mFetching Recommendations...\e[0m"
-    
-    video_id=$(echo "$last_url" | grep -oP 'v=\K[^&]+')
-    
-    rec_menu=$($YTDLP_CMD --flat-playlist \
-        --print "%(title)s|%(duration_string)s|%(uploader)s|%(webpage_url)s" \
-        --playlist-items 1-15 \
-        "https://www.youtube.com/watch?v=$video_id&list=RD$video_id")
-
-    if [ $(echo "$rec_menu" | wc -l) -le 1 ]; then
-        rec_menu=$($YTDLP_CMD --print "%(title)s|%(duration_string)s|%(uploader)s|%(webpage_url)s" "ytsearch12:$last_title")
-    fi
-
-    rec_selection=$(echo "$rec_menu" | grep -vEi "$video_id" | fzf \
-        --delimiter='|' --with-nth=1,2,3 \
-        --prompt="󰒭 Next > " --layout=reverse --border --height=85% \
-        --preview-window=right:48% \
-        --bind "ctrl-r:execute-silent(url=\$(echo {} | cut -d'|' -f4); id=\$(echo \$url | sha256sum | cut -d' ' -f1); rm -f $THUMB_DIR/\$id.jpg)+refresh-preview" \
-        --preview '
-            url=$(echo {} | cut -d"|" -f4)
-            id=$(echo "$url" | sha256sum | cut -d" " -f1)
-            img="$THUMB_DIR/$id.jpg"
-            
-            if [ ! -f "$img" ]; then
-                $YTDLP_CMD --skip-download --write-thumbnail --convert-thumbnails jpg -o "$THUMB_DIR/$id" "$url" > /dev/null 2>&1
-            fi
-            
-            echo -e "\n \e[1;32mUp Next:\e[0m\n $(echo {} | cut -d"|" -f1)\n"
-            printf "\n\n\n\n\n"
-
-            if [ -f "$img" ]; then
-                # Smaller placement to avoid covering the "Next >" prompt
-                kitty +kitten icat --transfer-mode=memory --clear --stdin=no --place 80x55@68x60 "$img"
-            fi
-        ')
-
-    kitty +kitten icat --clear
-
-    if [ -n "$rec_selection" ]; then
-        rec_url=$(echo "$rec_selection" | cut -d'|' -f4)
-        echo "$rec_selection" >> "$HISTORY_FILE"
-        $MPV "$rec_url"
-        show_recommendations "$rec_url" "$(echo "$rec_selection" | cut -d'|' -f1)"
-    fi
+# -------------------------
+# FORMAT
+# -------------------------
+format_for_fzf() {
+    $JQ -r '"\(.title)\t\(.id)\t\(.url)"'
 }
 
-# --- Main Loop ---
-query="$*"
-counter=0
-while true; do
-    ((counter++))
-    if ((counter == 5)); then
-        sleep 5 # rate limiting
-    fi
-    if [ -z "$query" ]; then
-        echo -e "\n\e[1;37m[h] History | [q] Quit\e[0m"
-        read -rp "Search YouTube: " query
-    fi
-    case "$query" in
-        q) exit 0 ;;
-        h) 
-            selection=$(tail -n 50 "$HISTORY_FILE" | tac | fzf --delimiter='|' --with-nth=1,2,3 --prompt="History > ")
-            [ -n "$selection" ] && $MPV "$(echo "$selection" | cut -d'|' -f4)"
-            ;;
-        *) show_search "$query" ;;
+# -------------------------
+# SMART RECOMMEND (REAL FIX)
+# -------------------------
+smart_recommend() {
+    [ ! -f "$HISTORY_FILE" ] && return
+
+    tmp=$(mktemp)
+
+    tail -n 5 "$HISTORY_FILE" | while read -r url; do
+        $YT_DLP --flat-playlist --dump-json "$url" 2>/dev/null
+    done | $JQ -c 'select(.id != null) | {
+        id: .id,
+        title: .title,
+        url: ("https://www.youtube.com/watch?v=" + .id),
+        thumb: .thumbnail
+    }' > "$tmp"
+
+    shuf "$tmp" | awk '!seen[$0]++' > "$QUEUE_FILE"
+}
+
+# -------------------------
+# AUTOPLAY LOOP
+# -------------------------
+autoplay_loop() {
+    while true; do
+        [ ! -s "$QUEUE_FILE" ] && smart_recommend
+
+        next=$(head -n 1 "$QUEUE_FILE")
+        [ -z "$next" ] && break
+
+        url=$(echo "$next" | $JQ -r '.url')
+        title=$(echo "$next" | $JQ -r '.title')
+
+        tail -n +2 "$QUEUE_FILE" > "$QUEUE_FILE.tmp" && mv "$QUEUE_FILE.tmp" "$QUEUE_FILE"
+
+        echo -e "\n▶ $title"
+        echo "⏭ Press 's' + ENTER to skip"
+
+        $MPV "$url" &
+        pid=$!
+
+        (
+            read -r key
+            [ "$key" = "s" ] && kill $pid 2>/dev/null
+        ) &
+
+        wait $pid 2>/dev/null
+        reset
+
+        echo "$url" >> "$HISTORY_FILE"
+        tail -n $MAX_HISTORY "$HISTORY_FILE" > "$HISTORY_FILE.tmp" && mv "$HISTORY_FILE.tmp" "$HISTORY_FILE"
+    done
+}
+
+# -------------------------
+# SEARCH
+# -------------------------
+search_mode() {
+    query=$(cat "$LAST_QUERY_FILE" 2>/dev/null)
+    read -rp "Search: " input
+    query="${input:-$query}"
+
+    echo "$query" > "$LAST_QUERY_FILE"
+
+    tmp=$(mktemp)
+
+    (
+        $YT_DLP --dump-json "ytsearch20:$query" |
+        $JQ -c '{id:.id,title:.title,url:.webpage_url,thumb:.thumbnail}' > "$tmp"
+    ) &
+
+    spinner $!
+
+    preload_thumbs < "$tmp"
+
+    formatted=$(mktemp)
+    cat "$tmp" | format_for_fzf > "$formatted"
+
+    run_fzf "$formatted"
+}
+
+# -------------------------
+# RECOMMENDED
+# -------------------------
+recommend_mode() {
+    tmp=$(mktemp)
+
+    (
+        $YT_DLP --playlist-items 1-20 --dump-json "https://www.youtube.com" |
+        $JQ -c 'select(.webpage_url!=null) | {id:.id,title:.title,url:.webpage_url,thumb:.thumbnail}' > "$tmp"
+    ) &
+
+    spinner $!
+
+    preload_thumbs < "$tmp"
+
+    formatted=$(mktemp)
+    cat "$tmp" | format_for_fzf > "$formatted"
+
+    run_fzf "$formatted"
+}
+
+# -------------------------
+# FZF UI
+# -------------------------
+run_fzf() {
+    input_file="$1"
+    echo 0 > "$OFFSET_FILE"
+
+    while true; do
+        offset=$(cat "$OFFSET_FILE")
+        total=$(wc -l < "$input_file")
+
+        start=$((offset + 1))
+        end=$((offset + RESULTS_PER_PAGE))
+        [ $end -gt $total ] && end=$total
+
+        header=$(printf "ENTER: Play | CTRL-R: Next | ESC: Back\n\n%s" \
+            "$(head -n 3 "$QUEUE_FILE" 2>/dev/null | $JQ -r '.title' 2>/dev/null | sed 's/^/⏭ /')")
+
+        selection=$(sed -n "${start},${end}p" "$input_file" | fzf \
+            --height=100% \
+            --layout=reverse \
+            --border \
+            --multi \
+            --delimiter='\t' \
+            --with-nth=1 \
+            --header "$header" \
+            --bind 'ctrl-r:abort' \
+            --preview '
+                title={1}
+                id=$(echo {2} | tr -d "[:space:]")
+                file="'$THUMB_DIR'/$id.jpg"
+
+                printf "\n %s\n\n" "$title"
+
+                if [ -f "$file" ]; then
+                    kitty +kitten icat --transfer-mode=memory \
+                        --clear --stdin=no \
+                        --place 80x55@0x0 \
+                        --align center \
+                        "$file" 2>/dev/null
+                fi
+            '
+        )
+
+        code=$?
+        [ $code -ne 0 ] && break
+
+        # next page
+        if [ -z "$selection" ]; then
+            offset=$((offset + RESULTS_PER_PAGE))
+            [ $offset -ge $total ] && offset=0
+            echo $offset > "$OFFSET_FILE"
+            continue
+        fi
+
+        urls=$(echo "$selection" | awk -F '\t' '{print $3}')
+
+        for url in $urls; do
+            echo "$url" >> "$HISTORY_FILE"
+        done
+        tail -n $MAX_HISTORY "$HISTORY_FILE" > "$HISTORY_FILE.tmp" && mv "$HISTORY_FILE.tmp" "$HISTORY_FILE"
+
+        $MPV $urls
+        reset
+
+        count=$(echo "$urls" | wc -w)
+
+        if [ "$count" -gt 1 ]; then
+            for url in $urls; do
+                echo "{\"url\":\"$url\",\"title\":\"manual\"}" >> "$QUEUE_FILE"
+            done
+            autoplay_loop
+            return
+        fi
+
+        if [ "$count" -eq 1 ]; then
+            smart_recommend
+            autoplay_loop
+            return
+        fi
+    done
+}
+
+# -------------------------
+# MENU
+# -------------------------
+choose_mode() {
+    mode=$(printf "Search\nRecommended\nQuit" | fzf)
+
+    case "$mode" in
+        "Search") search_mode ;;
+        "Recommended") recommend_mode ;;
+        *) exit ;;
     esac
-    query=""
+}
+
+# -------------------------
+# MAIN
+# -------------------------
+while true; do
+    choose_mode
 done
-# ---------- CONFIG END ---------- #
+
